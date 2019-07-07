@@ -1,0 +1,232 @@
+---
+title: "Statcast Aging Curves"
+author: "Peter L'Oiseau"
+date: "6/30/2019"
+output: word_document
+---
+
+```{r warning=FALSE, echo=FALSE, message=FALSE,options(kableExtra.auto_format = FALSE)}
+#The first set of csv files must be the only files in the folder in order to run the code.
+#Simply adjust the working directory (setwd())to fit your computer's envirnoment. DO NOT CHANGE the name of the files as
+#there are functions dependant on said names.The second set of csv files used in the next chunk must be 
+#in a seperate folder.
+
+setwd('C:/Users/Peter/Documents/baseball-databases/baseball savant')
+#required packages install necessary
+library(tidyverse)
+library(Lahman)
+library(baseballr)
+library(broom)
+library(ggrepel)
+library(gtools)
+library(kableExtra)
+library(knitr)
+
+#function to add the playing year and bind data sets from baseball savant
+add_columns <-function(input){
+  #install dplyr
+  if (!require("dplyr")) {
+    install.packages("dplyr", dependencies = TRUE)
+    library(dplyr)
+  }
+  #create empty df
+  df <- data.frame()
+  
+  #import multiple dataframes
+  temp <- list.files(path = input, pattern="*.csv")
+  temp1 <- paste0(input,temp)
+  
+  for (i in temp1){
+    #column values from file title
+    t<-strsplit(i,"_")
+    columns<-strsplit(t[[1]][2], ".",fixed = TRUE)
+
+    #create small df
+    df1 <- read.csv(i, header=TRUE,stringsAsFactors = FALSE)
+    
+    #add columns
+    df1<- df1 %>% mutate(yearID = as.numeric(columns[[1]][1]))
+    df <- rbind.data.frame(df,df1)
+  }
+  df
+}
+#excecute function and return data types to numeric
+cols<-c(6:32)
+savant<-add_columns(input = paste0(getwd(),"/"))
+savant[,cols]<-apply(savant[,cols],2,function(x) as.numeric(x));
+
+#thesaurus for linking the baseball savant data set to Lahman's Master data base (for purposes of determining age)
+#again reset working directory to find the files
+setwd('C:/Users/Peter/Documents/baseball-databases')
+
+v<-read.csv('master.csv')%>%arrange(mlb_id)
+v[is.na(v)]<-0
+
+u<-read.csv('SFBB Player ID Map - PLAYERIDMAP.csv')%>%arrange(MLBID)
+u[is.na(u)]<-0
+names(u)[which(names(u)=="MLBID")]<-"mlb_id"
+y<-full_join(u,v,by="mlb_id")
+
+#search thesaurus and add requsite IDs
+for(i in c(1:nrow(savant))){
+  if(!is.na(y$bref_id[which(y$mlb_id==savant$player_id[i])])){
+    savant$bbrefID[i]<-as.character(y$bref_id[which(y$mlb_id==savant$player_id[i])])
+  }else{
+    savant$bbrefID[i]<-as.character(y$BREFID[which(y$mlb_id==savant$player_id[i])])
+  }
+  savant$playerID[i]<-as.character(y$lahman_id[which(y$mlb_id==savant$player_id[i])])
+}
+
+#join databases and calculate age of player
+savant%>%
+  inner_join(Master,by="bbrefID")%>%
+  mutate(Birthyear=ifelse(birthMonth>=7,
+                          birthYear+1,birthYear),
+                          Age=yearID-Birthyear)->savant_age
+savant_age%>%drop_na(Age)->savant_age
+
+#eliminate players who only have one season of data. This is the cause of survivor bias which can be combated by 
+#entering phantom seasons based on that players projections. However there is not an easily available projection
+#system for statcast metrics. More details in article.
+a<-table(savant_age$player_id)
+for(i in savant_age$player_id){
+  if(a[names(a)==i]==1){
+    savant_age$player_id[which(savant_age$player_id==i)]<-NA
+  }
+}
+
+savant_age%>%drop_na(player_id)->multi_age
+
+#Calculate the differences season to season in launch angle and launch speed. Harmonic mean of batted balls 
+#in the two seasons is also calculated for weighting based on playing time.
+sort_multi_age<-multi_age%>%arrange(player_id,Age)
+sort_multi_age$la_diff[1]<-NA
+sort_multi_age$ls_diff[1]<-NA
+sort_multi_age$min_a[1]<-NA
+for(i in c(2:nrow(sort_multi_age))){
+  if(sort_multi_age$player_id[i]==sort_multi_age$player_id[i-1]&&sort_multi_age$Age[i]-sort_multi_age$Age[i-1]==1){
+    sort_multi_age$la_diff[i]<-sort_multi_age$launch_angle[i]-sort_multi_age$launch_angle[i-1]
+    sort_multi_age$ls_diff[i]<-sort_multi_age$launch_speed[i]-sort_multi_age$launch_speed[i-1]
+    sort_multi_age$min_a[i]<-min(sort_multi_age$abs[i],sort_multi_age$abs[i-1])
+  }else{
+    sort_multi_age$la_diff[i]<-NA
+    sort_multi_age$ls_diff[i]<-NA
+    sort_multi_age$min_a[i]<-NA
+  }
+}
+
+#shape data to plot the cumulative average difference for the second age in the couplet
+#one data set for playing time weights, one without
+delta<-sort_multi_age%>%drop_na(ls_diff)
+delta_fin<-as.data.frame(delta)%>%group_by(Age)%>%summarise(la_ave_diff=mean(la_diff),ls_ave_diff=mean(ls_diff),n=n())%>%filter(n>30)
+delta_fin$la_cumu<-cumsum(delta_fin$la_ave_diff)
+delta_fin$ls_cumu<-cumsum(delta_fin$ls_ave_diff)
+
+wdelta_fin<-delta%>%group_by(Age)%>%summarise(wla_ave_diff=mean(la_diff*min_a),wls_ave_diff=mean(ls_diff*min_a),n=n())%>%filter(n>30)
+wdelta_fin$wla_cumu<-cumsum(wdelta_fin$wla_ave_diff)
+wdelta_fin$wls_cumu<-cumsum(wdelta_fin$wls_ave_diff)
+
+#render table
+kable(round(delta_fin,2),"markdown")
+kable(round(wdelta_fin,2),"markdown")
+
+#render graphs
+delta_fin$weights<-"No"
+wdelta_fin$weights<-"Yes"
+delta_fin$ls_cumu<-scale(delta_fin$ls_cumu)
+wdelta_fin$wls_cumu<-scale(wdelta_fin$wls_cumu)
+names(delta_fin)<-names(wdelta_fin)
+  
+fdelta_fin<-rbind(wdelta_fin,delta_fin)
+
+ls<-ggplot(fdelta_fin,aes(x=Age,y=wls_cumu,group=weights,color=weights))+geom_point()+geom_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1)
+la<-ggplot(wdelta_fin,aes(x=Age,y=wla_cumu)) +geom_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1,se=F)
+
+#function for display
+lm_eqn = function(m) {
+
+  l <- list(a = format(abs(coef(m)[1]), digits = 2),
+      b = format(abs(coef(m)[2]), digits = 2),
+      c = format(coef(m)[3], digits = 2));
+
+  if (coef(m)[2] >= 0&&coef(m)[1] >=0)  {
+    eq <- substitute(italic(y) ==  c %.% italic(x)^2 + b %.% italic(x) + a,l)
+  } else if(coef(m)[2] < 0&&coef(m)[1] >=0) {
+    eq <- substitute(italic(y) == c %.% italic(x)^2 - b %.% italic(x) + a,l)    
+  } else if(coef(m)[2] < 0&&coef(m)[1] <0) {
+    eq <- substitute(italic(y) == c %.% italic(x)^2 - b %.% italic(x) - a,l)    
+  }else{
+    eq <- substitute(italic(y) == c %.% italic(x)^2 + b %.% italic(x) - a,l)
+  }
+
+  as.character(as.expression(eq));                 
+}
+print(ls+labs(title="Exit Velocity Aging Curve w/ and wo/ Weights"))
+print(la+geom_text(aes(x=26,y=1000,label = lm_eqn(lm(wla_cumu ~ Age + I(Age^2), wdelta_fin))), parse = TRUE)+labs(title="Weighted Launch Angle Aging Curve"))
+
+fit1<-lm(wls_cumu~Age+I(Age^2),delta_fin)
+s1<-summary(fit1)
+v1<--s1$coefficients[2,1]/(2*s1$coefficients[3,1])
+fit2<-lm(wls_cumu~Age+I(Age^2),wdelta_fin)
+s2<-summary(fit2)
+v2<--s2$coefficients[2,1]/(2*s2$coefficients[3,1])
+
+
+#Investigate the relationship between playing time (weight which is the minimum of the two seasons balls put it play) 
+#and launch speed differential as age increases
+play_ls_age<-ggplot(delta%>%filter(Age>=min(delta_fin$Age)&Age<=max(delta_fin$Age)),aes(min_a,ls_diff,group=factor(Age),color=factor(Age)))+geom_smooth(method = "lm", formula = y ~ x , size = 1,se = FALSE)+scale_colour_manual(name="Legend", values=c(rep("gray50",7),"blue",rep("gray50",6)))+ theme(legend.position = "none")+ labs(title = "Weighted Exit Velocity Differential vs. Playing Time by Age",x="Balls in Play",y="Exit Velocity Differential")+ theme(plot.title = element_text(size=12))
+
+play_ls_age
+#The Age 29/30 couplet again stands as a large outlier. We will estimate the equation of the line and based on the 
+#other lines and reweight the Age 30 group based on this estimated relationship
+delta_fin$intercept<-NA
+delta_fin$slope<-NA
+for(i in delta_fin$Age){
+  d<-delta%>%filter(Age==i)
+  fit<-lm(ls_diff~min_a,d)
+  delta_fin$intercept[which(delta_fin$Age==i)]<-summary(fit)$coefficients[1,1]
+  delta_fin$slope[which(delta_fin$Age==i)]<-summary(fit)$coefficients[2,1]
+}
+
+intfit<-lm(intercept~Age,delta_fin)
+slopefit<-lm(slope~Age,delta_fin)
+i<-anova(intfit)$'Pr(>F)'[1]
+s<-anova(slopefit)$'Pr(>F)'[1]
+
+#The p values in both cases are much greater than 0.05 which means we fail to reject the null hypothesis. This means
+#age is not a significant factor in the relationship between playing time and difference in launch speed from year to 
+#year. We can then adjust the Age 30 outlier based on the loess smoothing function, for details call ?loess().
+int_smooth_val = predict(loess(intercept~Age, delta_fin))[which(delta_fin$Age==30)]
+slope_smooth_val = predict(loess(slope~Age, delta_fin))[which(delta_fin$Age==30)]
+
+#We can not adjust the individual weights of Age 30 players to reflect the estimated relationship with launch speed #difference.
+
+for(i in c(1:nrow(delta))){
+    if(delta$Age[i]==30){
+      delta$ls_diff[i]=int_smooth_val+slope_smooth_val*delta$weight[i]
+    }
+}
+
+rplay_ls_age<-ggplot(delta%>%filter(Age>=min(delta_fin$Age)&Age<=max(delta_fin$Age)),aes(min_a,ls_diff,group=factor(Age),color=factor(Age)))+geom_smooth(method = "lm", formula = y ~ x , size = 1,se = FALSE)+scale_colour_manual(name="Legend", values=c(rep("gray50",7),"blue",rep("gray50",6)))+ theme(legend.position = "none")+ labs(title = "Reweighted Exit Velocity Differential vs. Playing Time by Age",x="Balls in Play",y="Exit Velocity Differential")+ theme(plot.title = element_text(size=12))
+
+rplay_ls_age
+#The reweighted age 30 season now has a relationship between playing time and launch angle difference more in line with
+#the other observed ages.This new weighting is now reflected in the below aging curve
+rwdelta_fin<-delta%>%group_by(Age)%>%summarise(rwls_ave_diff=mean(ls_diff*min_a),n=n())%>%filter(n>30)
+rwdelta_fin$rwls_cumu<-cumsum(rwdelta_fin$rwls_ave_diff)
+
+
+kable(round(rwdelta_fin,2),"markdown")
+
+rls<-ggplot(rwdelta_fin,aes(x=Age,y=rwls_cumu))+geom_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1,se=F)
+fit3<-lm(rwls_cumu~Age+I(Age^2),rwdelta_fin)
+s3<-summary(fit3)
+v3<--s3$coefficients[2,1]/(2*s3$coefficients[3,1])
+
+print(rls+geom_text(aes(x=26,y=100,label = lm_eqn(lm(rwls_cumu ~ Age + I(Age^2), rwdelta_fin))), parse = TRUE)+labs(title="Reweighted Exit Velocity Aging Curve"))
+
+
+```
+
+
+
